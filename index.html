@@ -30,7 +30,7 @@ a { color: var(--accent); }
 <body>
 <main>
 <h1>Get a snapshot</h1>
-<p class="sub">An assumeUTXO snapshot, fetched in this tab over WebTorrent from whoever is seeding it, hashed as the bytes arrive, and compared with the sha256 the record states. Nothing is saved to disk unless you click Save. Any snapshot with a torrent on the record can be loaded by <code>?snapshot=network-height</code>. A playground beside the <a href="https://assumeutxo.com/">assumeUTXO record</a>.</p>
+<p class="sub">An assumeUTXO snapshot, fetched in this tab over WebTorrent from whoever is seeding it, hashed as the bytes arrive, and compared with the sha256 the record states. Nothing is saved to disk unless you click Save. Any snapshot with a torrent on the record can be loaded by <code>?snapshot=network-height</code>, or any snapshot page anywhere by its URI. A playground beside the <a href="https://assumeutxo.com/">assumeUTXO record</a>.</p>
 
 <script type="application/ld+json" id="island">
 {
@@ -83,12 +83,17 @@ const fmt = (n) => n >= 1e9 ? (n / 1e9).toFixed(2) + ' GB' : n >= 1e6 ? (n / 1e6
 const light = (id, cls, text) => { $('l' + id).className = 'light ' + cls; $('s' + id).textContent = text }
 const esc = (x) => String(x).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
 
-// a record row (data/snapshots.json on assumeutxo.com) becomes the same shape as the island
+// a record row (data/snapshots.json) or a snapshot page's island (torrent: {infohash, magnet, webseed}) becomes the island's shape
+const normalise = (r, at) => {
+  const t = r.torrent || r
+  const magnet = t.magnet; if (!magnet || !r.bytes) return null
+  const seeds = [].concat(t.webseed || []).map((w) => (typeof w === 'string' ? w : w['@id'])).filter(Boolean)
+  return { network: r.network, height: r.height, chain: r.chain, bytes: r.bytes, sha256: r.sha256 || null, txoutsetHash: r.txoutsetHash, infohash: t.infohash, magnet, seeds, page: at || RECORD + (r.page || `snapshots/${r.network}-${r.height}.html`) }
+}
 const fromRow = (r) => {
   const m = new URL(r.magnet)
   const tr = m.searchParams.getAll('tr').filter((t) => t.startsWith('wss://'))
-  const ws = m.searchParams.getAll('ws')
-  const id = `${r.network}-${r.height}`
+  const ws = [...new Set([...m.searchParams.getAll('ws'), ...r.seeds])]
   return {
     '@context': ['https://torrent-schema.github.io/context.jsonld', { sha256: 'https://assumeutxo.com/ns#sha256', txoutset_hash: 'https://assumeutxo.com/ns#txoutsetHash', snapshot: 'https://assumeutxo.com/ns#snapshot' }],
     '@type': 'MetaInfo',
@@ -98,11 +103,20 @@ const fromRow = (r) => {
     magnet: r.magnet,
     announce: tr.length ? tr : WSS,
     urlList: ws,
-    sha256: r.sha256 || null,
-    snapshot: RECORD + (r.page || `snapshots/${id}.html`),
+    sha256: r.sha256,
+    snapshot: r.page,
     txoutset_hash: r.txoutsetHash,
-    comment: `${r.chain} at height ${r.height}, from the assumeUTXO record`
+    comment: `${r.chain || r.network} at height ${r.height}, from ${r.page}`
   }
+}
+// a full URI: a .json document is read as a row; anything else is a page whose first JSON-LD island is read
+const fromUri = async (u) => {
+  const res = await fetch(u); if (!res.ok) throw new Error(`${res.status} from ${u}`)
+  if (/\.json(\?|$)/.test(u) || (res.headers.get('content-type') || '').includes('json')) return normalise(await res.json(), u)
+  const html = await res.text()
+  const m = html.match(/<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/)
+  if (!m) throw new Error('no JSON-LD island on that page')
+  return normalise(JSON.parse(m[1]), u)
 }
 
 const params = new URLSearchParams(location.search)
@@ -113,15 +127,18 @@ try {
   const res = await fetch(RECORD + 'data/snapshots.json')
   rows = (await res.json()).snapshots.filter((r) => r.infohash && r.magnet && r.bytes)
 } catch (e) { $('others').textContent = 'could not read the record: ' + e.message }
-if (want) {
+let label = want
+if (want && /^https?:\/\//.test(want)) {
+  try { const r = await fromUri(want); if (!r) throw new Error('no torrent and size in that document'); T = fromRow(r); label = want.replace(/^https?:\/\//, '') } catch (e) { $('others').textContent = `could not load ${want}: ${e.message}`; label = null }
+} else if (want) {
   const [network, h] = want.split('-')
   const row = rows.find((r) => r.network === network && String(r.height) === h)
-  if (row) { T = fromRow(row); $('island').textContent = JSON.stringify(T, null, 2); document.title = `Get ${want}` } else { $('others').textContent = `no torrent on the record for "${want}"` }
+  if (row) T = fromRow(normalise(row)); else { $('others').textContent = `no torrent on the record for "${want}"`; label = null }
 }
-$('filehead').textContent = want && rows.length ? `The file: ${want}` : 'The file'
-if (rows.length) {
+if (label) { $('island').textContent = JSON.stringify(T, null, 2); document.title = `Get ${label}`; $('filehead').textContent = `The file: ${label}` }
+if (rows.length && !$('others').textContent) {
   const links = rows.map((r) => { const id = `${r.network}-${r.height}`; return (want === id) ? `<b>${id}</b>` : `<a href="?snapshot=${id}">${id}</a>` })
-  $('others').innerHTML = 'Snapshots with a torrent on the record: ' + links.join(' · ')
+  $('others').innerHTML = 'Snapshots with a torrent on the record: ' + links.join(' · ') + '. A full URI of a snapshot page works too: <code>?snapshot=https://…</code>'
 }
 
 const facts = [['name', esc(T.name)], ['size', `${T.length.toLocaleString()} bytes (${fmt(T.length)})`], ['infohash', T.infoHash], ['sha256', T.sha256 || '<i>not on the record yet</i>'], ['txoutset_hash', T.txoutset_hash], ['web seed', T.urlList.length ? esc(T.urlList[0]) : '<i>none in the magnet; peers only</i>'], ['on the record', `<a href="${T.snapshot}">${T.snapshot.replace(/^https:\/\//, '')}</a>`], ['magnet', `<a href="${esc(T.magnet)}">magnet link</a>`]]

@@ -21,7 +21,7 @@ button:disabled { opacity: .5; cursor: default; }
 .bar { height: 10px; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; margin: 12px 0 6px; background: color-mix(in srgb, var(--fg) 4%, var(--bg)); }
 .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
 .light { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #bbb; margin-right: 8px; vertical-align: middle; }
-.light.ok { background: var(--ok); } .light.bad { background: var(--bad); } .light.busy { background: var(--accent); }
+.light.ok { background: var(--ok); } .light.grey { background: #bbb; } .light.bad { background: var(--bad); } .light.busy { background: var(--accent); }
 .ok { color: var(--ok); } .bad { color: var(--bad); } .note { color: var(--muted); font-size: .85rem; }
 .status { font-size: .9rem; margin: 6px 0; }
 a { color: var(--accent); }
@@ -30,7 +30,7 @@ a { color: var(--accent); }
 <body>
 <main>
 <h1>Get a snapshot</h1>
-<p class="sub">An assumeUTXO snapshot, fetched in this tab over WebTorrent from whoever is seeding it, hashed as the bytes arrive, and compared with the sha256 the record states. Nothing is saved to disk unless you click Save. A playground beside the <a href="https://assumeutxo.com/">assumeUTXO record</a>.</p>
+<p class="sub">An assumeUTXO snapshot, fetched in this tab over WebTorrent from whoever is seeding it, hashed as the bytes arrive, and compared with the sha256 the record states. Nothing is saved to disk unless you click Save. Any snapshot with a torrent on the record can be loaded by <code>?snapshot=network-height</code>. A playground beside the <a href="https://assumeutxo.com/">assumeUTXO record</a>.</p>
 
 <script type="application/ld+json" id="island">
 {
@@ -50,8 +50,9 @@ a { color: var(--accent); }
 </script>
 
 <section>
-<h2>The file</h2>
+<h2 id="filehead">The file</h2>
 <dl id="facts"></dl>
+<p id="others" class="note"></p>
 </section>
 
 <section>
@@ -74,12 +75,58 @@ a { color: var(--accent); }
 <script type="module">
 import WebTorrent from 'https://cdn.jsdelivr.net/npm/webtorrent@2.8.4/dist/webtorrent.min.js'
 
-const T = JSON.parse(document.getElementById('island').textContent)
+const RECORD = 'https://assumeutxo.com/'
+const WSS = ['wss://tracker.openwebtorrent.com', 'wss://tracker.webtorrent.dev', 'wss://tracker.btorrent.xyz']
+const RAM_LIMIT = 2e9 // bytes a tab can be expected to hold while checking
 const $ = (id) => document.getElementById(id)
 const fmt = (n) => n >= 1e9 ? (n / 1e9).toFixed(2) + ' GB' : n >= 1e6 ? (n / 1e6).toFixed(1) + ' MB' : n >= 1e3 ? (n / 1e3).toFixed(0) + ' kB' : n + ' B'
+const light = (id, cls, text) => { $('l' + id).className = 'light ' + cls; $('s' + id).textContent = text }
+const esc = (x) => String(x).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
 
-const facts = [['name', T.name], ['size', `${T.length.toLocaleString()} bytes (${fmt(T.length)})`], ['infohash', T.infoHash], ['sha256', T.sha256], ['txoutset_hash', T.txoutset_hash], ['web seed', T.urlList[0]], ['on the record', `<a href="${T.snapshot}">${T.snapshot.replace(/^https:\/\//, '')}</a>`], ['magnet', `<a href="${T.magnet}">magnet link</a>`]]
+// a record row (data/snapshots.json on assumeutxo.com) becomes the same shape as the island
+const fromRow = (r) => {
+  const m = new URL(r.magnet)
+  const tr = m.searchParams.getAll('tr').filter((t) => t.startsWith('wss://'))
+  const ws = m.searchParams.getAll('ws')
+  const id = `${r.network}-${r.height}`
+  return {
+    '@context': ['https://torrent-schema.github.io/context.jsonld', { sha256: 'https://assumeutxo.com/ns#sha256', txoutset_hash: 'https://assumeutxo.com/ns#txoutsetHash', snapshot: 'https://assumeutxo.com/ns#snapshot' }],
+    '@type': 'MetaInfo',
+    name: m.searchParams.get('dn') || `utxo-${r.height}.dat`,
+    length: r.bytes,
+    infoHash: r.infohash,
+    magnet: r.magnet,
+    announce: tr.length ? tr : WSS,
+    urlList: ws,
+    sha256: r.sha256 || null,
+    snapshot: RECORD + (r.page || `snapshots/${id}.html`),
+    txoutset_hash: r.txoutsetHash,
+    comment: `${r.chain} at height ${r.height}, from the assumeUTXO record`
+  }
+}
+
+const params = new URLSearchParams(location.search)
+const want = params.get('snapshot')
+let T = JSON.parse($('island').textContent)
+let rows = []
+try {
+  const res = await fetch(RECORD + 'data/snapshots.json')
+  rows = (await res.json()).snapshots.filter((r) => r.infohash && r.magnet && r.bytes)
+} catch (e) { $('others').textContent = 'could not read the record: ' + e.message }
+if (want) {
+  const [network, h] = want.split('-')
+  const row = rows.find((r) => r.network === network && String(r.height) === h)
+  if (row) { T = fromRow(row); $('island').textContent = JSON.stringify(T, null, 2); document.title = `Get ${want}` } else { $('others').textContent = `no torrent on the record for "${want}"` }
+}
+$('filehead').textContent = want && rows.length ? `The file: ${want}` : 'The file'
+if (rows.length) {
+  const links = rows.map((r) => { const id = `${r.network}-${r.height}`; return (want === id) ? `<b>${id}</b>` : `<a href="?snapshot=${id}">${id}</a>` })
+  $('others').innerHTML = 'Snapshots with a torrent on the record: ' + links.join(' · ')
+}
+
+const facts = [['name', esc(T.name)], ['size', `${T.length.toLocaleString()} bytes (${fmt(T.length)})`], ['infohash', T.infoHash], ['sha256', T.sha256 || '<i>not on the record yet</i>'], ['txoutset_hash', T.txoutset_hash], ['web seed', T.urlList.length ? esc(T.urlList[0]) : '<i>none in the magnet; peers only</i>'], ['on the record', `<a href="${T.snapshot}">${T.snapshot.replace(/^https:\/\//, '')}</a>`], ['magnet', `<a href="${esc(T.magnet)}">magnet link</a>`]]
 $('facts').innerHTML = facts.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')
+if (T.length > RAM_LIMIT) { $('go').disabled = true; light(1, 'grey', `${fmt(T.length)} is more than a tab can hold in memory; use the magnet link in a torrent client and compare the sha256 yourself`) }
 
 // streaming SHA-256, FIPS 180-4, plain JS so no library is trusted for the check
 class Sha256 {
@@ -111,7 +158,6 @@ class Sha256 {
   }
 }
 
-const light = (id, cls, text) => { $('l' + id).className = 'light ' + cls; $('s' + id).textContent = text }
 let file = null
 
 $('go').onclick = async () => {
@@ -149,7 +195,9 @@ $('go').onclick = async () => {
   clearInterval(tick)
   $('fill').style.width = '100%'
   light(1, 'ok', `downloaded ${fmt(T.length)}`)
-  if (hex === T.sha256) { light(2, 'ok', 'sha256 matches the record: ' + hex) } else { light(2, 'bad', 'sha256 does NOT match the record: ' + hex) }
+  if (!T.sha256) light(2, 'grey', 'sha256 of what arrived (the record has none to compare): ' + hex)
+  else if (hex === T.sha256) light(2, 'ok', 'sha256 matches the record: ' + hex)
+  else light(2, 'bad', 'sha256 does NOT match the record: ' + hex)
   $('save').disabled = false
 }
 
